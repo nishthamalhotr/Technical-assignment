@@ -305,7 +305,19 @@ def workdays_inclusive(start: date, end: date) -> int:
     return full_weeks * 5 + first_weekdays + min(after_weekend, 5)
 
 
-def month_log_pipeline(emp_code: str, start: date, end: date) -> list[dict[str, Any]]:
+def month_log_pipeline(
+    emp_code: str,
+    start: date,
+    end: date,
+    joined_on: date | None = None,
+) -> list[dict[str, Any]]:
+    present_conditions: list[dict[str, Any]] = [
+        {"$in": ["$status", list(PRESENCE_STATUSES)]},
+        {"$gte": ["$_weekday", 2]},
+        {"$lte": ["$_weekday", 6]},
+    ]
+    if joined_on is not None:
+        present_conditions.append({"$gte": ["$date", joined_on.isoformat()]})
     return [
         {"$match": {"emp_code": emp_code, "date": {"$gte": start.isoformat(), "$lte": end.isoformat()}}},
         {
@@ -323,13 +335,7 @@ def month_log_pipeline(emp_code: str, start: date, end: date) -> list[dict[str, 
                 "present_days": {
                     "$sum": {
                         "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$status", list(PRESENCE_STATUSES)]},
-                                    {"$gte": ["$_weekday", 2]},
-                                    {"$lte": ["$_weekday", 6]},
-                                ]
-                            },
+                            {"$and": present_conditions},
                             {"$cond": [{"$eq": [{"$ifNull": ["$half_day", False]}, True]}, 0.5, 1]},
                             0,
                         ]
@@ -376,12 +382,13 @@ def department_summary_pipeline(start: date, end: date, department: str | None) 
                 "_id": "$department",
                 "headcount": {"$sum": 1},
                 "emp_codes": {"$push": "$emp_code"},
+                "employee_join_dates": {"$push": {"emp_code": "$emp_code", "joined_on": "$joined_on"}},
             }
         },
         {
             "$lookup": {
                 "from": "attendance_logs",
-                "let": {"codes": "$emp_codes"},
+                "let": {"codes": "$emp_codes", "join_dates": "$employee_join_dates"},
                 "pipeline": [
                     {
                         "$match": {
@@ -390,6 +397,28 @@ def department_summary_pipeline(start: date, end: date, department: str | None) 
                                     {"$in": ["$emp_code", "$$codes"]},
                                     {"$gte": ["$date", start.isoformat()]},
                                     {"$lte": ["$date", end.isoformat()]},
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$addFields": {
+                            "_joined_on": {
+                                "$arrayElemAt": [
+                                    {
+                                        "$map": {
+                                            "input": {
+                                                "$filter": {
+                                                    "input": "$$join_dates",
+                                                    "as": "employee",
+                                                    "cond": {"$eq": ["$$employee.emp_code", "$emp_code"]},
+                                                }
+                                            },
+                                            "as": "employee",
+                                            "in": "$$employee.joined_on",
+                                        }
+                                    },
+                                    0,
                                 ]
                             }
                         }
@@ -416,6 +445,7 @@ def department_summary_pipeline(start: date, end: date, department: str | None) 
                                         {
                                             "$and": [
                                                 {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                                                {"$gte": ["$date", "$_joined_on"]},
                                                 {"$gte": ["$_weekday", 2]},
                                                 {"$lte": ["$_weekday", 6]},
                                             ]
@@ -585,7 +615,13 @@ def trend_pipeline(department: str, start: date, end: date) -> list[dict[str, An
                 },
                 "emp_codes": {
                     "$map": {
-                        "input": "$employees",
+                        "input": {
+                            "$filter": {
+                                "input": "$employees",
+                                "as": "employee",
+                                "cond": {"$lte": ["$$employee.joined_on", "$dates"]},
+                            }
+                        },
                         "as": "employee",
                         "in": "$$employee.emp_code",
                     }
@@ -904,7 +940,12 @@ def employee_monthly(
     joined_on = parse_date(employee["joined_on"], "joined_on")
     working_start = max(start, joined_on)
     working_days = workdays_inclusive(working_start, end) if working_start <= end else 0
-    result = list(db.attendance_logs.aggregate(month_log_pipeline(emp_code, start, end), allowDiskUse=True))
+    result = list(
+        db.attendance_logs.aggregate(
+            month_log_pipeline(emp_code, start, end, joined_on),
+            allowDiskUse=True,
+        )
+    )
     metrics = result[0] if result else {}
     present_days = half_up(metrics.get("present_days", 0))
     attendance_pct = half_up(Decimal(str(present_days)) * 100 / working_days, 4) if working_days else None
@@ -1026,7 +1067,9 @@ def explain_endpoint(
         if endpoint == "employee_monthly":
             if emp_code is None:
                 raise HTTPException(422, "emp_code is required")
-            pipeline = month_log_pipeline(emp_code, start, end)
+            explained_employee = db.employees.find_one({"emp_code": emp_code}, {"_id": 0, "joined_on": 1})
+            joined_on = parse_date(explained_employee["joined_on"], "joined_on") if explained_employee else None
+            pipeline = month_log_pipeline(emp_code, start, end, joined_on)
         else:
             pipeline = leaderboard_pipeline(start, end, department, limit)
         explained = db.command(
